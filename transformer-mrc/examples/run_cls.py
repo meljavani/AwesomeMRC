@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ Finetuning the library models for sequence classification on GLUE (Bert, XLM, XLNet, RoBERTa)."""
-
 from __future__ import absolute_import, division, print_function
 
 import argparse
@@ -55,6 +54,9 @@ from transformers import (WEIGHTS_NAME, BertConfig,
                                   XLMRobertaConfig,
                                   XLMRobertaForSequenceClassification,
                                   XLMRobertaTokenizer,
+                                  AutoConfig,
+                                  AutoTokenizer,
+                                  AutoModel
                                 )
 
 from transformers import AdamW, get_linear_schedule_with_warmup
@@ -65,11 +67,23 @@ from transformers import glue_processors as processors
 from transformers import glue_convert_examples_to_features as convert_examples_to_features
 import sys
 import csv
-csv.field_size_limit(sys.maxsize)
+# csv.field_size_limit(sys.maxsize)
+maxInt = sys.maxsize
+
+while True:
+    # decrease the maxInt value by factor 10 
+    # as long as the OverflowError occurs.
+
+    try:
+        csv.field_size_limit(maxInt)
+        break
+    except OverflowError:
+        maxInt = int(maxInt/10)
+
 logger = logging.getLogger(__name__)
 
-ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig, XLMConfig, 
-                                                                                RobertaConfig, DistilBertConfig)), ())
+# ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig, XLMConfig, 
+                                                                                # RobertaConfig, DistilBertConfig, AutoConfig)), ())
 
 MODEL_CLASSES = {
     'bert': (BertConfig, BertForSequenceClassification, BertTokenizer),
@@ -79,6 +93,7 @@ MODEL_CLASSES = {
     'distilbert': (DistilBertConfig, DistilBertForSequenceClassification, DistilBertTokenizer),
     'albert': (AlbertConfig, AlbertForSequenceClassification, AlbertTokenizer),
     'xlmroberta': (XLMRobertaConfig, XLMRobertaForSequenceClassification, XLMRobertaTokenizer),
+    'parsbert': (AutoConfig, AutoModel, AutoTokenizer)
 }
 
 
@@ -377,8 +392,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, predict=False
 
 def main():
     parser = argparse.ArgumentParser()
-
-    ## Required parameters
+    # Required
     parser.add_argument("--data_dir", default=None, type=str, required=False,
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
     parser.add_argument("--predict_file", default=None, type=str, required=False,
@@ -386,7 +400,7 @@ def main():
     parser.add_argument("--model_type", default=None, type=str, required=True,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
     parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
-                        help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
+                        help="Path to pre-trained model or shortcut name selected in the list: ")
     parser.add_argument("--task_name", default=None, type=str, required=True,
                         help="The name of the task to train selected in the list: " + ", ".join(processors.keys()))
     parser.add_argument("--output_dir", default=None, type=str, required=True,
@@ -500,14 +514,14 @@ def main():
     args.output_mode = output_modes[args.task_name]
     label_list = processor.get_labels()
     num_labels = len(label_list)
-
+    print(num_labels)
     # Load pretrained model and tokenizer
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
+    config = config_class.from_pretrained("HooshvareLab/albert-fa-zwnj-base-v2",
                                           num_labels=num_labels,
                                           finetuning_task=args.task_name,
                                           cache_dir=args.cache_dir if args.cache_dir else None)

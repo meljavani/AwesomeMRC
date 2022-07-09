@@ -3,7 +3,7 @@ export DATA_DIR=data
 export TASK_NAME=squad
 python ./examples/run_cls.py \
     --model_type albert \
-    --model_name_or_path albert-xxlarge-v2 \
+    --model_name_or_path HooshvareLab/albert-fa-zwnj-base-v2 \
     --task_name $TASK_NAME \
     --do_train \
     --do_eval \
