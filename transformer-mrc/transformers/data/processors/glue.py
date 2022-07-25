@@ -13,9 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" GLUE processors and helpers """
+""" GLUE processors and helpers"""
 
-import logging
 import os
 import warnings
 from dataclasses import asdict
@@ -23,546 +22,585 @@ from enum import Enum
 from typing import List, Optional, Union
 
 from ...tokenization_utils import PreTrainedTokenizer
+from ...utils import is_tf_available, logging
 from .utils import DataProcessor, InputExample, InputFeatures
-from ...file_utils import is_tf_available
+
+
 if is_tf_available():
     import tensorflow as tf
 
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
-def getInputs(example, tokenizer, mask_padding_with_zero, max_length, pad_token, pad_token_segment_id, pad_on_left, encode_direction="forward"):
+DEPRECATION_WARNING = (
+    "This {0} will be removed from the library soon, preprocessing should be handled with the 🤗 Datasets "
+    "library. You can have a look at this example script for pointers: "
+    "https://github.com/huggingface/transformers/blob/main/examples/pytorch/text-classification/run_glue.py"
+)
 
-    if encode_direction == "forward":
-        inputs = tokenizer.encode_plus(
-            example.text_a,
-            example.text_b,
-            add_special_tokens=True,
-            max_length=max_length,
-        )
-    else:
-        inputs = tokenizer.encode_plus(
-            example.text_b,
-            example.text_a,
-            add_special_tokens=True,
-            max_length=max_length,
-        )
 
-    input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
-
-    # The mask has 1 for real tokens and 0 for padding tokens. Only real
-    # tokens are attended to.
-    attention_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
-
-    # Zero-pad up to the sequence length.
-    padding_length = max_length - len(input_ids)
-
-    if pad_on_left:
-        input_ids = ([pad_token] * padding_length) + input_ids
-        attention_mask = ([0 if mask_padding_with_zero else 1] * padding_length) + attention_mask
-        token_type_ids = ([pad_token_segment_id] * padding_length) + token_type_ids
-    else:
-        input_ids = input_ids + ([pad_token] * padding_length)
-        attention_mask = attention_mask + ([0 if mask_padding_with_zero else 1] * padding_length)
-        token_type_ids = token_type_ids + ([pad_token_segment_id] * padding_length)
-
-    assert len(input_ids) == max_length, "Error with input length {} vs {}".format(len(input_ids), max_length)
-    assert len(attention_mask) == max_length, "Error with input length {} vs {}".format(len(attention_mask), max_length)
-    assert len(token_type_ids) == max_length, "Error with input length {} vs {}".format(len(token_type_ids), max_length)
-
-    return input_ids, attention_mask, token_type_ids
-
-def glue_convert_examples_to_features(examples, tokenizer,
-                                      max_length=512,
-                                      task=None,
-                                      label_list=None,
-                                      output_mode=None,
-                                      pad_on_left=False,
-                                      pad_token=0,
-                                      pad_token_segment_id=0,
-                                      mask_padding_with_zero=True, output_feature=False, pq_end=False,max_query_length=64):
+def glue_convert_examples_to_features(
+    examples: Union[List[InputExample], "tf.data.Dataset"],
+    tokenizer: PreTrainedTokenizer,
+    max_length: Optional[int] = None,
+    task=None,
+    label_list=None,
+    output_mode=None,
+):
     """
-    Loads a data file into a list of ``InputFeatures``
+    Loads a data file into a list of `InputFeatures`
 
     Args:
-        examples: List of ``InputExamples`` or ``tf.data.Dataset`` containing the examples.
+        examples: List of `InputExamples` or `tf.data.Dataset` containing the examples.
         tokenizer: Instance of a tokenizer that will tokenize the examples
-        max_length: Maximum example length
+        max_length: Maximum example length. Defaults to the tokenizer's max_len
         task: GLUE task
-        label_list: List of labels. Can be obtained from the processor using the ``processor.get_labels()`` method
-        output_mode: String indicating the output mode. Either ``regression`` or ``classification``
-        pad_on_left: If set to ``True``, the examples will be padded on the left rather than on the right (default)
-        pad_token: Padding token
-        pad_token_segment_id: The segment ID for the padding token (It is usually 0, but can vary such as for XLNet where it is 4)
-        mask_padding_with_zero: If set to ``True``, the attention mask will be filled by ``1`` for actual values
-            and by ``0`` for padded values. If set to ``False``, inverts it (``1`` for padded values, ``0`` for
-            actual values)
-        answer_mode: 0(default): original; 1: cat question+answer; 2:cat doc+answer; 3:dual
+        label_list: List of labels. Can be obtained from the processor using the `processor.get_labels()` method
+        output_mode: String indicating the output mode. Either `regression` or `classification`
+
     Returns:
-        If the ``examples`` input is a ``tf.data.Dataset``, will return a ``tf.data.Dataset``
-        containing the task-specific features. If the input is a list of ``InputExamples``, will return
-        a list of task-specific ``InputFeatures`` which can be fed to the model.
+        If the `examples` input is a `tf.data.Dataset`, will return a `tf.data.Dataset` containing the task-specific
+        features. If the input is a list of `InputExamples`, will return a list of task-specific `InputFeatures` which
+        can be fed to the model.
 
     """
-    is_tf_dataset = False
+    warnings.warn(DEPRECATION_WARNING.format("function"), FutureWarning)
     if is_tf_available() and isinstance(examples, tf.data.Dataset):
-        is_tf_dataset = True
+        if task is None:
+            raise ValueError("When calling glue_convert_examples_to_features from TF, the task parameter is required.")
+        return _tf_glue_convert_examples_to_features(examples, tokenizer, max_length=max_length, task=task)
+    return _glue_convert_examples_to_features(
+        examples, tokenizer, max_length=max_length, task=task, label_list=label_list, output_mode=output_mode
+    )
+
+
+if is_tf_available():
+
+    def _tf_glue_convert_examples_to_features(
+        examples: tf.data.Dataset,
+        tokenizer: PreTrainedTokenizer,
+        task=str,
+        max_length: Optional[int] = None,
+    ) -> tf.data.Dataset:
+        """
+        Returns:
+            A `tf.data.Dataset` containing the task-specific features.
+
+        """
+        processor = glue_processors[task]()
+        examples = [processor.tfds_map(processor.get_example_from_tensor_dict(example)) for example in examples]
+        features = glue_convert_examples_to_features(examples, tokenizer, max_length=max_length, task=task)
+        label_type = tf.float32 if task == "sts-b" else tf.int64
+
+        def gen():
+            for ex in features:
+                d = {k: v for k, v in asdict(ex).items() if v is not None}
+                label = d.pop("label")
+                yield (d, label)
+
+        input_names = tokenizer.model_input_names
+
+        return tf.data.Dataset.from_generator(
+            gen,
+            ({k: tf.int32 for k in input_names}, label_type),
+            ({k: tf.TensorShape([None]) for k in input_names}, tf.TensorShape([])),
+        )
+
+
+def _glue_convert_examples_to_features(
+    examples: List[InputExample],
+    tokenizer: PreTrainedTokenizer,
+    max_length: Optional[int] = None,
+    task=None,
+    label_list=None,
+    output_mode=None,
+):
+    if max_length is None:
+        max_length = tokenizer.model_max_length
 
     if task is not None:
         processor = glue_processors[task]()
         if label_list is None:
             label_list = processor.get_labels()
-            logger.info("Using label list %s for task %s" % (label_list, task))
+            logger.info(f"Using label list {label_list} for task {task}")
         if output_mode is None:
             output_mode = glue_output_modes[task]
-            logger.info("Using output mode %s for task %s" % (output_mode, task))
+            logger.info(f"Using output mode {output_mode} for task {task}")
 
     label_map = {label: i for i, label in enumerate(label_list)}
 
-    features = []
-    id_map = {}
-    for (ex_index, example) in enumerate(examples):
-        if ex_index % 10000 == 0:
-            logger.info("Writing example %d" % (ex_index))
-        if is_tf_dataset:
-            example = processor.get_example_from_tensor_dict(example)
-            example = processor.tfds_map(example)
-        id_map[ex_index] = example.guid
-
-
-        if pq_end:
-            query = tokenizer.encode(
-                example.text_a, add_special_tokens=False, max_length=max_query_length
-            )
-        else:
-            query = example.text_a
-        inputs = tokenizer.encode_plus(
-            query,
-            example.text_b,
-            add_special_tokens=True,
-            max_length=max_length,
-        )
-        input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
-
-        # The mask has 1 for real tokens and 0 for padding tokens. Only real
-        # tokens are attended to.
-        attention_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
-
-        # Zero-pad up to the sequence length.
-        padding_length = max_length - len(input_ids)
-
-        if pad_on_left:
-            input_ids = ([pad_token] * padding_length) + input_ids
-            attention_mask = ([0 if mask_padding_with_zero else 1] * padding_length) + attention_mask
-            token_type_ids = ([pad_token_segment_id] * padding_length) + token_type_ids
-        else:
-            input_ids = input_ids + ([pad_token] * padding_length)
-            attention_mask = attention_mask + ([0 if mask_padding_with_zero else 1] * padding_length)
-            token_type_ids = token_type_ids + ([pad_token_segment_id] * padding_length)
-
-        assert len(input_ids) == max_length, "Error with input length {} vs {}".format(len(input_ids), max_length)
-        assert len(attention_mask) == max_length, "Error with input length {} vs {}".format(len(attention_mask), max_length)
-        assert len(token_type_ids) == max_length, "Error with input length {} vs {}".format(len(token_type_ids), max_length)
-
+    def label_from_example(example: InputExample) -> Union[int, float, None]:
+        if example.label is None:
+            return None
         if output_mode == "classification":
-            label = label_map[example.label]
+            return label_map[example.label]
         elif output_mode == "regression":
-            label = float(example.label)
-        else:
-            raise KeyError(output_mode)
+            return float(example.label)
+        raise KeyError(output_mode)
 
-        if ex_index < 5:
-            logger.info("*** Example ***")
-            logger.info("guid: %s" % (example.guid))
-            logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-            logger.info("attention_mask: %s" % " ".join([str(x) for x in attention_mask]))
-            logger.info("token_type_ids: %s" % " ".join([str(x) for x in token_type_ids]))
-            logger.info("label: %s (id = %d)" % (example.label, label))
-        #obtain pa_end
-        if pq_end:
-            seq_len = attention_mask.count(1)
-            text_b_len = token_type_ids.count(1)
-            text_a_len = seq_len - text_b_len
-            question_end_index = text_a_len - 1
-            doc_end_index = seq_len - 1
-            pq_end_pos = [question_end_index,doc_end_index] #hack here, q and p are written reversely to keep consistent with the modeling
-            features.append(
-                InputFeatures(input_ids=input_ids,
-                              attention_mask=attention_mask,
-                              token_type_ids=token_type_ids,
-                              label=label,
-                              pq_end_pos=pq_end_pos))
-        else:
-            features.append(
-                InputFeatures(input_ids=input_ids,
-                              attention_mask=attention_mask,
-                              token_type_ids=token_type_ids,
-                              label=label))
+    labels = [label_from_example(example) for example in examples]
 
-    if output_feature:
-        return features,id_map
+    batch_encoding = tokenizer(
+        [(example.text_a, example.text_b) for example in examples],
+        max_length=max_length,
+        padding="max_length",
+        truncation=True,
+    )
+
+    features = []
+    for i in range(len(examples)):
+        inputs = {k: batch_encoding[k][i] for k in batch_encoding}
+
+        feature = InputFeatures(**inputs, label=labels[i])
+        features.append(feature)
+
+    for i, example in enumerate(examples[:5]):
+        logger.info("*** Example ***")
+        logger.info(f"guid: {example.guid}")
+        logger.info(f"features: {features[i]}")
+
     return features
+
+
+class OutputMode(Enum):
+    classification = "classification"
+    regression = "regression"
 
 
 class MrpcProcessor(DataProcessor):
     """Processor for the MRPC data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['sentence1'].numpy().decode('utf-8'),
-                            tensor_dict['sentence2'].numpy().decode('utf-8'),
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["sentence1"].numpy().decode("utf-8"),
+            tensor_dict["sentence2"].numpy().decode("utf-8"),
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        logger.info("LOOKING AT {}".format(os.path.join(data_dir, "train.tsv")))
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        logger.info(f"LOOKING AT {os.path.join(data_dir, 'train.tsv')}")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return ["0", "1"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
         examples = []
-        for (i, line) in enumerate(lines):
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, i)
+            guid = f"{set_type}-{i}"
             text_a = line[3]
             text_b = line[4]
-            label = line[0]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            label = None if set_type == "test" else line[0]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
 
 class MnliProcessor(DataProcessor):
     """Processor for the MultiNLI data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['premise'].numpy().decode('utf-8'),
-                            tensor_dict['hypothesis'].numpy().decode('utf-8'),
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["premise"].numpy().decode("utf-8"),
+            tensor_dict["hypothesis"].numpy().decode("utf-8"),
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev_matched.tsv")),
-            "dev_matched")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev_matched.tsv")), "dev_matched")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test_matched.tsv")), "test_matched")
 
     def get_labels(self):
         """See base class."""
         return ["contradiction", "entailment", "neutral"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
         examples = []
-        for (i, line) in enumerate(lines):
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, line[0])
+            guid = f"{set_type}-{line[0]}"
             text_a = line[8]
             text_b = line[9]
-            label = line[-1]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            label = None if set_type.startswith("test") else line[-1]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
 
 class MnliMismatchedProcessor(MnliProcessor):
     """Processor for the MultiNLI Mismatched data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev_mismatched.tsv")),
-            "dev_matched")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev_mismatched.tsv")), "dev_mismatched")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test_mismatched.tsv")), "test_mismatched")
 
 
 class ColaProcessor(DataProcessor):
     """Processor for the CoLA data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['sentence'].numpy().decode('utf-8'),
-                            None,
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["sentence"].numpy().decode("utf-8"),
+            None,
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return ["0", "1"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
+        test_mode = set_type == "test"
+        if test_mode:
+            lines = lines[1:]
+        text_index = 1 if test_mode else 3
         examples = []
-        for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            text_a = line[3]
-            label = line[1]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+        for i, line in enumerate(lines):
+            guid = f"{set_type}-{i}"
+            text_a = line[text_index]
+            label = None if test_mode else line[1]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
         return examples
 
 
 class Sst2Processor(DataProcessor):
     """Processor for the SST-2 data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['sentence'].numpy().decode('utf-8'),
-                            None,
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["sentence"].numpy().decode("utf-8"),
+            None,
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return ["0", "1"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
         examples = []
-        for (i, line) in enumerate(lines):
+        text_index = 1 if set_type == "test" else 0
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, i)
-            text_a = line[0]
-            label = line[1]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+            guid = f"{set_type}-{i}"
+            text_a = line[text_index]
+            label = None if set_type == "test" else line[1]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
         return examples
 
 
 class StsbProcessor(DataProcessor):
     """Processor for the STS-B data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['sentence1'].numpy().decode('utf-8'),
-                            tensor_dict['sentence2'].numpy().decode('utf-8'),
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["sentence1"].numpy().decode("utf-8"),
+            tensor_dict["sentence2"].numpy().decode("utf-8"),
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return [None]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
         examples = []
-        for (i, line) in enumerate(lines):
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, line[0])
+            guid = f"{set_type}-{line[0]}"
             text_a = line[7]
             text_b = line[8]
-            label = line[-1]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            label = None if set_type == "test" else line[-1]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
 
 class QqpProcessor(DataProcessor):
     """Processor for the QQP data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['question1'].numpy().decode('utf-8'),
-                            tensor_dict['question2'].numpy().decode('utf-8'),
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["question1"].numpy().decode("utf-8"),
+            tensor_dict["question2"].numpy().decode("utf-8"),
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return ["0", "1"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
+        test_mode = set_type == "test"
+        q1_index = 1 if test_mode else 3
+        q2_index = 2 if test_mode else 4
         examples = []
-        for (i, line) in enumerate(lines):
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, line[0])
+            guid = f"{set_type}-{line[0]}"
             try:
-                text_a = line[3]
-                text_b = line[4]
-                label = line[5]
+                text_a = line[q1_index]
+                text_b = line[q2_index]
+                label = None if test_mode else line[5]
             except IndexError:
                 continue
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
 
 class QnliProcessor(DataProcessor):
     """Processor for the QNLI data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['question'].numpy().decode('utf-8'),
-                            tensor_dict['sentence'].numpy().decode('utf-8'),
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["question"].numpy().decode("utf-8"),
+            tensor_dict["sentence"].numpy().decode("utf-8"),
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev_matched")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return ["entailment", "not_entailment"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
         examples = []
-        for (i, line) in enumerate(lines):
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, line[0])
+            guid = f"{set_type}-{line[0]}"
             text_a = line[1]
             text_b = line[2]
-            label = line[-1]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            label = None if set_type == "test" else line[-1]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
 
 class RteProcessor(DataProcessor):
     """Processor for the RTE data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['sentence1'].numpy().decode('utf-8'),
-                            tensor_dict['sentence2'].numpy().decode('utf-8'),
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["sentence1"].numpy().decode("utf-8"),
+            tensor_dict["sentence2"].numpy().decode("utf-8"),
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return ["entailment", "not_entailment"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
         examples = []
-        for (i, line) in enumerate(lines):
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, line[0])
+            guid = f"{set_type}-{line[0]}"
             text_a = line[1]
             text_b = line[2]
-            label = line[-1]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            label = None if set_type == "test" else line[-1]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
 
 class WnliProcessor(DataProcessor):
     """Processor for the WNLI data set (GLUE version)."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warnings.warn(DEPRECATION_WARNING.format("processor"), FutureWarning)
+
     def get_example_from_tensor_dict(self, tensor_dict):
         """See base class."""
-        return InputExample(tensor_dict['idx'].numpy(),
-                            tensor_dict['sentence1'].numpy().decode('utf-8'),
-                            tensor_dict['sentence2'].numpy().decode('utf-8'),
-                            str(tensor_dict['label'].numpy()))
+        return InputExample(
+            tensor_dict["idx"].numpy(),
+            tensor_dict["sentence1"].numpy().decode("utf-8"),
+            tensor_dict["sentence2"].numpy().decode("utf-8"),
+            str(tensor_dict["label"].numpy()),
+        )
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
 
     def get_labels(self):
         """See base class."""
         return ["0", "1"]
 
     def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
+        """Creates examples for the training, dev and test sets."""
         examples = []
-        for (i, line) in enumerate(lines):
+        for i, line in enumerate(lines):
             if i == 0:
                 continue
-            guid = "%s-%s" % (set_type, line[0])
+            guid = f"{set_type}-{line[0]}"
             text_a = line[1]
             text_b = line[2]
-            label = line[-1]
-            examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+            label = None if set_type == "test" else line[-1]
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
 
 class SQuADProcessor(DataProcessor):
